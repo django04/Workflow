@@ -1,0 +1,11 @@
+fetch dt.davis.problems
+| filter event.id == "{{ event()['event.id'] }}"
+| expand event_id = dt.davis.event_ids
+| lookup [
+    fetch dt.davis.events
+    | fields event.id, device_name = <cle_device_name>
+  ],
+  sourceField: event_id, lookupField: event.id,
+  fields: { device_name }
+| filter isNotNull(device_name)
+| fields node = device_name
