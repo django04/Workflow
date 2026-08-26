@@ -1,0 +1,19 @@
+{
+  "types": [
+    {
+      "mappings": {
+        "node": {
+          "type": "string"
+        }
+      },
+      "indexRange": [
+        0,
+        0
+      ]
+    }
+  ],
+  "records": [
+    {
+      "node": "caga3026.prprivmgmt.intraxa"
+    }
+  ],
