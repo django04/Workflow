@@ -1,1 +1,4 @@
-timeseries { avg(`com.dynatrace.extension.sql-oracle.uptime`), value.A = avg(`com.dynatrace.extension.sql-oracle.uptime`, scalar: true) }, by: {  device.address, device.name,  `dt.entity.sql:com_dynatrace_extension_sql-oracle_database`, `dt.entity.sql:com_dynatrace_extension_sql-oracle_instance`, instance.name }, filter: instance.role == "PRIMARY_INSTANCE"
+fetch logs
+| filter dt.system.bucket == "nom_de_ton_bucket"
+| fieldsKeep timestamp, loglevel, content, dt.entity.host
+| limit 100000
