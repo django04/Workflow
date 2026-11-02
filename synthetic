@@ -1,0 +1,4 @@
+fetch dt.davis.problems
+| filter matchesValue(affected_entity_types, "dt.entity.http_check")
+| fields display_id, event.status, entity_tags, affected_entity_types, event.description
+| limit 10
