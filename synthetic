@@ -11,3 +11,38 @@ Début : {{ event()["event.start"] }}
 {{ event()["event.description"] }}
 
 Voir le problème : {{ environment().url }}/ui/apps/dynatrace.davis.problems/problem/{{ event()["event.id"] }}
+## {% if event()["event.status"] == "CLOSED" %}Notification de résolution d'incident{% else %}Notification d'incident – Monitoring synthétique HTTP{% endif %}
+
+Bonjour,
+
+{% if event()["event.status"] == "CLOSED" %}Nous vous informons que l'incident ci-dessous, détecté par le monitoring synthétique Dynatrace, est désormais **résolu**.{% else %}Nous vous informons qu'un incident a été détecté par le monitoring synthétique Dynatrace sur un service placé sous la responsabilité de l'équipe **SPAS**.{% endif %}
+
+### Récapitulatif
+
+| | |
+|---|---|
+| **Référence** | {{ event()["display_id"] }} |
+| **Statut** | {{ "Résolu" if event()["event.status"] == "CLOSED" else "Ouvert" }} |
+| **Intitulé** | {{ event()["event.name"] }} |
+| **Catégorie** | {{ event()["event.category"] }} |
+| **Équipe concernée** | SPAS |
+| **Début (UTC)** | {{ event()["event.start"][:19] | replace("T", " ") }} |
+{% if event()["event.status"] == "CLOSED" %}| **Fin (UTC)** | {{ event()["event.end"][:19] | replace("T", " ") }} |
+{% endif %}
+
+### Détails
+
+{{ event()["event.description"] }}
+
+### Accès au problème
+
+[Consulter le problème {{ event()["display_id"] }} dans Dynatrace]({{ environment().url }}/ui/apps/dynatrace.davis.problems/problem/{{ event()["event.id"] }})
+
+{% if event()["event.status"] != "CLOSED" %}Nous vous remercions de bien vouloir prendre en charge cet incident dans les meilleurs délais.{% endif %}
+
+Cordialement,
+
+**Supervision – Dynatrace**
+
+---
+*Ce message est généré automatiquement. Merci de ne pas y répondre.*
