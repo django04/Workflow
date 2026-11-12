@@ -1,4 +1,70 @@
-timeseries active = avg(`com.dynatrace.extension.sql-oracle.sessions.active`),
-  by: { instance.name }, from: now()-14d, interval: 1h
-| fieldsAdd pic = arrayMax(active), moyenne = arrayAvg(active)
-| fields instance.name, moyenne, pic
+Besoin
+Réaliser un audit de conformité des hypothèses de sécurité associées à l'utilisation résiduelle des tokens PAT Dynatrace afin de :
+
+Vérifier que les mesures compensatoires définies dans le RAF sont toujours respectées.
+Produire les éléments de preuve attendus par la SSI.
+Identifier les éventuels écarts nécessitant un plan de remédiation.
+Fournir les éléments permettant de justifier la clôture du RAF.
+ 
+
+Critères d'acceptation
+Globalement, voici les critères : 
+
+Vérifier que seuls les administrateurs Dynatrace peuvent créer des tokens PAT.
+Vérifier que le nombre de tokens est maîtrisé et justifié par environnement.
+Vérifier qu'un token est dédié à un seul collecteur.
+Vérifier que les scopes sont limités à l'ingestion (pas de lecture ni administration).
+Vérifier que chaque token possède une date d'expiration et fait l'objet d'une recertification.
+En détail sur chaque hypothèse fournie par la SSI : 
+
+ 
+
+Hypothèse 1 : Restriction des créateurs de tokens
+Vérifier que seuls les administrateurs Dynatrace sont habilités à créer les tokens d'ingestion.
+
+Preuves attendues :
+
+Liste des profils disposant du rôle permettant la création des tokens.
+Vérification que le nombre de personnes habilitées reste limité conformément au RAF.
+Capture ou export des rôles d'administration Dynatrace.
+ 
+
+Hypothèse 2 : Maîtrise du nombre de tokens
+Vérifier que le nombre de tokens créés reste limité aux environnements AXA nécessitant une ingestion OTEL.
+
+Preuves attendues :
+
+Inventaire des tokens existants.
+Rattachement de chaque token à un environnement identifié.
+Justification de chaque token présent. (ex: les cartes AJIR créé pour les tokens à créer/modifier...)
+ 
+
+Hypothèse 3 : Un token dédié par collecteur
+Vérifier qu'un unique token est associé à chaque collecteur d'ingestion.
+
+Preuves attendues :
+
+Cartographie collecteur ↔ token.
+Identification des collecteurs actifs.
+ 
+
+Hypothèse 4 : Restriction des privilèges
+Vérifier que les scopes attribués aux tokens sont limités à l'ingestion et respectent le principe du moindre privilège.
+
+Preuves attendues :
+
+Export des scopes de chaque token.
+Vérification de l'absence de droits de lecture ou d'administration.
+Rapport de conformité des permissions.
+ 
+Hypothèse 5 : Gestion du cycle de vie
+Vérifier que chaque token dispose :
+
+d'une date d'expiration ;
+d'un processus de renouvellement ;
+d'une recertification périodique.
+Preuves attendues :
+
+Liste des dates d'expiration.
+Éléments de recertification annuelle.
+Identification des tokens expirés ou proches de l'expiration.
