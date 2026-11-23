@@ -27,8 +27,12 @@ SCHEMA = "builtin:synthetic.http.outage-handling"
 THRESHOLD_DEFAULT = 2
 
 
-def session(token):
+def session(token, verify_ssl=False):
     s = requests.Session()
+    s.verify = verify_ssl
+    if not verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     s.headers.update({
         "Authorization": f"Api-Token {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -115,10 +119,23 @@ def main():
     p.add_argument("--tag", help="Filtre les moniteurs par tag (ex: env:prod)")
     p.add_argument("--environment", action="store_true",
                    help="Modifie uniquement la valeur par défaut (scope environment)")
+    p.add_argument("--url", help="URL Dynatrace (sinon variable DT_URL)")
+    p.add_argument("--token", help="API token (sinon variable DT_TOKEN)")
+    p.add_argument("--verify-ssl", action="store_true",
+                   help="Active la vérification du certificat SSL (désactivée par défaut)")
     args = p.parse_args()
 
-    base = os.environ["DT_URL"].rstrip("/")
-    s = session(os.environ["DT_TOKEN"])
+    url = args.url or os.environ.get("DT_URL")
+    token = args.token or os.environ.get("DT_TOKEN")
+    if not url or not token:
+        dt_vars = [k for k in os.environ if "DT" in k.upper() or "DYNATRACE" in k.upper()]
+        print("✗ DT_URL et/ou DT_TOKEN introuvables dans l'environnement de ce terminal.", file=sys.stderr)
+        print(f"  Variables proches trouvées : {dt_vars or 'aucune'}", file=sys.stderr)
+        print("  -> passe-les en arguments : --url https://xxx.live.dynatrace.com --token dt0c01...",
+              file=sys.stderr)
+        sys.exit(2)
+    base = url.rstrip("/")
+    s = session(token, verify_ssl=args.verify_ssl)
 
     existing = get_existing_objects(s, base)
 
