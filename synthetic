@@ -1,48 +1,156 @@
-fetch dt.davis.problems
-| filter matchesValue(affected_entity_types, "dt.entity.http_check")
-| fields display_id, event.status, entity_tags, affected_entity_types, event.description
-| limit 10
-[{{ "RÉSOLU" if event()["event.status"] == "CLOSED" else "OUVERT" }}] {{ event()["display_id"] }} – {{ event()["event.name"] }}
-Statut : {{ event()["event.status"] }}
-Catégorie : {{ event()["event.category"] }}
-Début : {{ event()["event.start"] }}
-{% if event()["event.status"] == "CLOSED" %}Fin : {{ event()["event.end"] }}{% endif %}
+#!/usr/bin/env python3
+"""
+Met à jour "Alert if all locations are unable to access my web application"
+(globalOutages / globalConsecutiveOutageCountThreshold) sur les moniteurs HTTP
+Dynatrace via le schéma Settings 2.0 builtin:synthetic.http.outage-handling.
 
-{{ event()["event.description"] }}
+Token requis : settings.read, settings.write, ReadSyntheticData
 
-Voir le problème : {{ environment().url }}/ui/apps/dynatrace.davis.problems/problem/{{ event()["event.id"] }}
-## {% if event()["event.status"] == "CLOSED" %}Notification de résolution d'incident{% else %}Notification d'incident – Monitoring synthétique HTTP{% endif %}
+Usage :
+  export DT_URL="https://<env-id>.live.dynatrace.com"
+  export DT_TOKEN="dt0c01...."
+  python3 set_http_outage_threshold.py                  # dry-run, tous les moniteurs HTTP
+  python3 set_http_outage_threshold.py --apply          # applique
+  python3 set_http_outage_threshold.py --apply --monitor HTTP_CHECK-ABC123 --monitor HTTP_CHECK-DEF456
+  python3 set_http_outage_threshold.py --apply --tag env:prod
+  python3 set_http_outage_threshold.py --apply --environment   # valeur par défaut au niveau environnement
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
 
-Bonjour,
+import requests
 
-{% if event()["event.status"] == "CLOSED" %}Nous vous informons que l'incident ci-dessous, détecté par le monitoring synthétique Dynatrace, est désormais **résolu**.{% else %}Nous vous informons qu'un incident a été détecté par le monitoring synthétique Dynatrace sur un service placé sous la responsabilité de l'équipe **SPAS**.{% endif %}
+SCHEMA = "builtin:synthetic.http.outage-handling"
+THRESHOLD_DEFAULT = 2
 
-### Récapitulatif
 
-| | |
-|---|---|
-| **Référence** | {{ event()["display_id"] }} |
-| **Statut** | {{ "Résolu" if event()["event.status"] == "CLOSED" else "Ouvert" }} |
-| **Intitulé** | {{ event()["event.name"] }} |
-| **Catégorie** | {{ event()["event.category"] }} |
-| **Équipe concernée** | SPAS |
-| **Début (UTC)** | {{ event()["event.start"][:19] | replace("T", " ") }} |
-{% if event()["event.status"] == "CLOSED" %}| **Fin (UTC)** | {{ event()["event.end"][:19] | replace("T", " ") }} |
-{% endif %}
+def session(token):
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"Api-Token {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    })
+    return s
 
-### Détails
 
-{{ event()["event.description"] }}
+def list_http_monitors(s, base, tag=None):
+    params = {"type": "HTTP"}
+    if tag:
+        params["tag"] = tag
+    r = s.get(f"{base}/api/v1/synthetic/monitors", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("monitors", [])
 
-### Accès au problème
 
-[Consulter le problème {{ event()["display_id"] }} dans Dynatrace]({{ environment().url }}/ui/apps/dynatrace.davis.problems/problem/{{ event()["event.id"] }})
+def get_existing_objects(s, base):
+    """Retourne {scope: {objectId, value}} pour tous les objets du schéma."""
+    objects = {}
+    params = {"schemaIds": SCHEMA, "fields": "objectId,value,scope", "pageSize": 500}
+    url = f"{base}/api/v2/settings/objects"
+    while True:
+        r = s.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("items", []):
+            objects[item["scope"]] = item
+        nxt = data.get("nextPageKey")
+        if not nxt:
+            break
+        params = {"nextPageKey": nxt}
+    return objects
 
-{% if event()["event.status"] != "CLOSED" %}Nous vous remercions de bien vouloir prendre en charge cet incident dans les meilleurs délais.{% endif %}
 
-Cordialement,
+def default_value():
+    # Valeurs utilisées si aucun objet n'existe encore pour le scope
+    # Champs requis par le schéma (doc Dynatrace) ; case 2 (localOutages) laissée désactivée
+    return {
+        "globalOutages": True,
+        "globalConsecutiveOutageCountThreshold": 1,
+        "localOutages": False,
+        "localLocationOutageCountThreshold": 1,
+        "localConsecutiveOutageCountThreshold": 1,
+    }
 
-**Supervision – Dynatrace**
 
----
-*Ce message est généré automatiquement. Merci de ne pas y répondre.*
+def upsert(s, base, scope, existing, threshold, apply, env_value=None):
+    # Pas d'objet sur le moniteur -> on part du défaut environnement s'il existe
+    if existing:
+        value = dict(existing["value"])
+    else:
+        value = dict(env_value) if env_value else default_value()
+    before = value.get("globalConsecutiveOutageCountThreshold")
+    if value.get("globalOutages") is True and before == threshold:
+        print(f"  = {scope}: déjà à {threshold}, rien à faire")
+        return True
+
+    value["globalOutages"] = True
+    value["globalConsecutiveOutageCountThreshold"] = threshold
+
+    action = "PUT" if existing else "POST"
+    print(f"  {'→' if apply else '[dry-run]'} {scope}: {before} -> {threshold} ({action})")
+    if not apply:
+        return True
+
+    if existing:
+        r = s.put(f"{base}/api/v2/settings/objects/{existing['objectId']}",
+                  json={"value": value}, timeout=30)
+    else:
+        r = s.post(f"{base}/api/v2/settings/objects",
+                   json=[{"schemaId": SCHEMA, "scope": scope, "value": value}], timeout=30)
+
+    if r.status_code >= 300:
+        print(f"    ✗ HTTP {r.status_code}: {r.text}", file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--apply", action="store_true", help="Applique les changements (sinon dry-run)")
+    p.add_argument("--threshold", type=int, default=THRESHOLD_DEFAULT)
+    p.add_argument("--monitor", action="append", help="HTTP_CHECK-xxx (répétable)")
+    p.add_argument("--tag", help="Filtre les moniteurs par tag (ex: env:prod)")
+    p.add_argument("--environment", action="store_true",
+                   help="Modifie uniquement la valeur par défaut (scope environment)")
+    args = p.parse_args()
+
+    base = os.environ["DT_URL"].rstrip("/")
+    s = session(os.environ["DT_TOKEN"])
+
+    existing = get_existing_objects(s, base)
+
+    if args.environment:
+        scopes = ["environment"]
+    elif args.monitor:
+        scopes = args.monitor
+    else:
+        monitors = list_http_monitors(s, base, args.tag)
+        scopes = [m["entityId"] for m in monitors]
+        names = {m["entityId"]: m["name"] for m in monitors}
+        print(f"{len(scopes)} moniteur(s) HTTP trouvé(s)")
+        for sc in scopes:
+            print(f"  - {sc}  {names[sc]}")
+
+    if args.apply:
+        backup_file = f"backup_outage_handling_{datetime.now():%Y%m%d_%H%M%S}.json"
+        # null = pas d'objet avant (le moniteur héritait du défaut) -> rollback = supprimer l'objet créé
+        backup = {sc: existing.get(sc) for sc in scopes}
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(backup, f, indent=2, ensure_ascii=False)
+        print(f"\nSauvegarde écrite : {backup_file}")
+
+    print(f"\nSeuil cible : {args.threshold} échec(s) consécutif(s) "
+          f"{'(APPLY)' if args.apply else '(DRY-RUN)'}")
+    env_obj = existing.get("environment")
+    env_value = env_obj["value"] if env_obj else None
+    ok = sum(upsert(s, base, sc, existing.get(sc), args.threshold, args.apply, env_value)
+             for sc in scopes)
+    print(f"\n{ok}/{len(scopes)} OK")
+    sys.exit(0 if ok == len(scopes) else 1)
+
+
+if __name__ == "__main__":
+    main()
