@@ -1,19 +1,119 @@
-{
-  "types": [
-    {
-      "mappings": {
-        "node": {
-          "type": "string"
-        }
-      },
-      "indexRange": [
-        0,
-        0
-      ]
-    }
-  ],
-  "records": [
-    {
-      "node": "caga3026.prprivmgmt.intraxa"
-    }
-  ],
+# Workflow – Alerte monitoring synthétique HTTP (Dynatrace only)
+
+Task order:
+
+```
+trigger → get_monitors ──────────┐
+        → get_synthetic_events ──┴→ build_emails → send_email → fail_if_unrouted
+```
+
+The built-in Send email action renders Markdown (headings, bold, links, tables), not HTML.
+The `build_emails` task produces the full Markdown body, so the email task only passes it through.
+
+---
+
+## 1. Trigger – Problem trigger (Davis problem)
+
+- **Problem state:** Active **and** Closed (no updates)
+- **Additional custom filter query:**
+
+```
+matchesValue(affected_entity_types, "dt.entity.http_check")
+```
+
+---
+
+## 2. Task `get_monitors` – Execute DQL Query
+
+```
+fetch dt.entity.http_check
+| filter in(id, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
+| fieldsAdd tags
+| fields id, name = entity.name, tags
+```
+
+---
+
+## 3. Task `get_synthetic_events` – Execute DQL Query
+
+One query returns three kinds of records; the JS task correlates them:
+- `http_monitor_execution` → location + result per execution
+- `http_step_execution` → failing step number + status code/message
+- any event with `result.statistics.url` → tested URL
+
+```
+fetch dt.synthetic.events, from: toTimestamp("{{ event()['event.start'] }}") - 15m, to: now()
+| filter in(dt.synthetic.monitor.id, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
+| filter event.type == "http_monitor_execution"
+      or event.type == "http_step_execution"
+      or isNotNull(result.statistics.url)
+| fields timestamp,
+         type       = event.type,
+         monitor_id = dt.synthetic.monitor.id,
+         location   = entityName(dt.entity.synthetic_location),
+         step       = dt.synthetic.step.sequence_number,
+         state      = result.state,
+         code       = result.status.code,
+         message    = result.status.message,
+         url        = result.statistics.url
+| sort timestamp desc
+| limit 2000
+```
+
+---
+
+## 4. Task `build_emails` – Run JavaScript
+
+Paste `build_emails.js` and edit its configuration block (tag keys, admin mailbox, `ROUTING`, `STEP_OFFSET`).
+
+---
+
+## 5. Task `send_email` – Send email
+
+- **Options → Loop task:** list = `{{ result("build_emails").emails }}`, item variable name = `item`
+- **To:** `{{ _.item.to }}`
+- **Subject:** `{{ _.item.subject }}`
+- **Message:** `{{ _.item.body }}`
+
+---
+
+## 6. Task `fail_if_unrouted` – Run JavaScript
+
+Runs after `send_email` succeeds. Fails the run if a monitor had no team tag or a tag missing from `ROUTING` (the admin mailbox already received the email).
+
+```js
+import { execution } from '@dynatrace-sdk/automation-utils';
+
+export default async function ({ execution_id }) {
+  const ex = await execution(execution_id);
+  const { unrouted = [] } = await ex.result('build_emails');
+
+  if (unrouted.length) {
+    const list = unrouted
+      .map((u) => `${u.monitor} (${u.id}, tag équipe : ${u.team ?? 'absent'})`)
+      .join('; ');
+    throw new Error(`Moniteurs sans routage : ${list}`);
+  }
+  return { ok: true };
+}
+```
+
+---
+
+## Before going live – Notebook checks
+
+```
+fetch dt.synthetic.events
+| filter dt.synthetic.monitor.id == "HTTP_CHECK-XXXXXXXXXXXXXXXX"
+| fields timestamp, event.type, dt.entity.synthetic_location, dt.synthetic.step.sequence_number,
+         result.state, result.status.code, result.status.message, result.statistics.url
+| sort timestamp desc
+| limit 20
+```
+
+Confirm:
+1. `event.type` values are `http_monitor_execution` / `http_step_execution`.
+2. `dt.entity.synthetic_location` is filled on monitor executions (deprecated in favour of `dt.smartscape.synthetic_location`, still usable).
+3. Whether `dt.synthetic.step.sequence_number` starts at 0 (then set `STEP_OFFSET = 1`).
+4. `result.statistics.url` is populated.
+5. The problem link in a test email opens the problem (`/ui/apps/dynatrace.davis.problems/problem/P-…`).
