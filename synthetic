@@ -202,9 +202,7 @@ function buildBody(it) {
   L.push('');
   L.push(`**Moniteur :** ${it.monitor}`);
   L.push('');
-  L.push(`**URL du moniteur :** ${it.monitorUrl ? `[${it.monitorUrl}](${it.monitorUrl})` : '—'}`);
-  L.push('');
-  if (it.url && it.url !== it.monitorUrl) {
+  if (it.url) {
     L.push(`**URL en erreur :** [${it.url}](${it.url})`);
     L.push('');
   }
@@ -224,7 +222,7 @@ function buildBody(it) {
     L.push(`| Durée totale | **${cell(it.duration)}** |`);
   }
   if (it.problemTitle) L.push(`| Titre du problème | ${cell(it.problemTitle)} |`);
-  L.push(`| Cause racine (Davis) | **${cell(it.rootCause || 'Non identifiée')}** |`);
+  L.push(`| Cause racine (dernier échec) | **${cell(it.rootCause || 'Non identifiée')}** |`);
   L.push(`| Problème Dynatrace | [${cell(it.problemId)}](${it.problemUrl}) |`);
   L.push('');
 
@@ -333,6 +331,24 @@ export default async function ({ execution_id }) {
 
     // Header URL: first failing URL if any, else any URL seen for these monitors
     const url = failures.find((f) => f.url)?.url ?? synth.find((r) => ids.has(r.monitor_id) && r.url)?.url ?? '';
+    // Root cause = last failed result (most recent failed step, else failed execution) for these monitors
+    const lastFail = synth
+      .filter((r) => ids.has(r.monitor_id) && r.state === 'FAIL' && (r.code != null || r.message))
+      .sort((a, b) => {
+        const d = (toDate(b.timestamp)?.getTime() ?? 0) - (toDate(a.timestamp)?.getTime() ?? 0);
+        return d || (a.type === 'http_step_execution' ? -1 : 1); // same time: prefer the step event
+      })[0];
+    const lastSrc = lastFail ?? rawRows[0];
+    let lastFailure = '';
+    if (lastSrc) {
+      const tc = translateCause(lastSrc.code, lastSrc.message);
+      const when = lastFail ? fmtDate(toDate(lastFail.timestamp)) : '';
+      const stepTxt = lastSrc.step !== undefined && lastSrc.step !== null && lastSrc.step !== ''
+        ? `step ${lastFail ? Number(lastSrc.step) + STEP_OFFSET : lastSrc.step}` : '';
+      const ctx = [lastSrc.location, stepTxt, when].filter(Boolean).join(', ');
+      lastFailure = `${tc.cause} — ${tc.detail}${ctx ? ` (${ctx})` : ''}`;
+    }
+
     // Monitor URL = URL of its first step (lowest step number seen in the detail events)
     const monitorUrl =
       synth
@@ -353,7 +369,7 @@ export default async function ({ execution_id }) {
       problemId,
       problemUrl,
       problemTitle,
-      rootCause,
+      rootCause: lastFailure,
       failures,
     };
 
