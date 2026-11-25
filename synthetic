@@ -48,15 +48,29 @@ function fmtDuration(start, end) {
   return [h ? `${h} h` : null, m ? `${m} min` : null, `${s} s`].filter(Boolean).join(' ');
 }
 
-// Handles "key:value" and "[Context]key:value"; keys lowercased
+// Accepts tags as an array of "key:value" / "[Context]key:value" strings, an array of
+// { key, value } objects, or a JSON / comma-separated string. Keys are lowercased.
 function parseTags(tags) {
+  let list = tags;
+  if (typeof list === 'string') {
+    try { list = JSON.parse(list); } catch { list = list.split(/[,;]/); }
+  }
+  if (!Array.isArray(list)) list = list ? [list] : [];
+
   const out = {};
-  for (const raw of tags ?? []) {
+  const add = (k, v) => {
+    const key = String(k ?? '').trim().toLowerCase();
+    if (key && v !== undefined && v !== null && !(key in out)) out[key] = String(v).trim();
+  };
+  for (const raw of list) {
+    if (raw && typeof raw === 'object') {
+      if ('key' in raw) add(raw.key, raw.value);
+      else if (raw.stringRepresentation) add(...String(raw.stringRepresentation).replace(/^\[[^\]]*\]/, '').split(/:(.*)/s, 2));
+      continue;
+    }
     const t = String(raw).replace(/^\[[^\]]*\]/, '');
-    const i = t.indexOf(':');
-    if (i < 0) continue;
-    const k = t.slice(0, i).trim().toLowerCase();
-    if (!(k in out)) out[k] = t.slice(i + 1).trim();
+    const m = t.match(/^\s*([^:=]+?)\s*[:=]\s*(.+)$/);
+    if (m) add(m[1], m[2]);
   }
   return out;
 }
@@ -78,6 +92,37 @@ const highestCrit = (values) => CRIT_ORDER.find((c) => values.includes(c)) ?? 'N
 
 // Escape table-breaking characters for Markdown cells
 const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+
+// Preferred source: dt.synthetic.http.executions metric split by location AND step.
+// One row per monitor × location × failed step, with the URL taken from the step detail events.
+function buildRowsFromMetric(metricRows, events, monitorIds) {
+  const rows = [];
+  const seen = new Set();
+  const sorted = [...metricRows]
+    .filter((m) => monitorIds.has(m.monitor_id))
+    .sort((a, b) => String(a.location).localeCompare(String(b.location)) || Number(a.step ?? 0) - Number(b.step ?? 0));
+  for (const m of sorted) {
+    const key = `${m.monitor_id}|${m.location}|${m.step}`;
+    if (seen.has(key)) continue; // several status messages for the same step: keep the first (most frequent first in query)
+    seen.add(key);
+    const hasStep = m.step !== undefined && m.step !== null;
+    const detail = events
+      .filter((e) => e.url && e.monitor_id === m.monitor_id && (!hasStep || String(e.step) === String(m.step)))
+      .sort((a, b) => (toDate(b.timestamp)?.getTime() ?? 0) - (toDate(a.timestamp)?.getTime() ?? 0))[0];
+    rows.push({
+      monitor_id: m.monitor_id,
+      location: m.location ?? 'Inconnue',
+      step: hasStep ? Number(m.step) + STEP_OFFSET : '',
+      step_name: m.step_name ?? '',
+      code: m.code,
+      message: m.message,
+      http_status: m.http_status,
+      count: m.failures,
+      url: detail?.url ?? '',
+    });
+  }
+  return rows;
+}
 
 // Latest failed monitor execution per monitor × location, with EVERY failed step of that execution
 // (one row per failed step, each with its own URL)
@@ -157,8 +202,10 @@ function buildBody(it) {
   L.push('');
   L.push(`**Moniteur :** ${it.monitor}`);
   L.push('');
-  if (it.url) {
-    L.push(`**URL testée :** [${it.url}](${it.url})`);
+  L.push(`**URL du moniteur :** ${it.monitorUrl ? `[${it.monitorUrl}](${it.monitorUrl})` : '—'}`);
+  L.push('');
+  if (it.url && it.url !== it.monitorUrl) {
+    L.push(`**URL en erreur :** [${it.url}](${it.url})`);
     L.push('');
   }
   L.push(`**[➜ Accéder au problème dans Dynatrace](${it.problemUrl})**`);
@@ -176,6 +223,8 @@ function buildBody(it) {
     L.push(`| Fin de l'incident | **${cell(it.end)}** (heure de Paris) |`);
     L.push(`| Durée totale | **${cell(it.duration)}** |`);
   }
+  if (it.problemTitle) L.push(`| Titre du problème | ${cell(it.problemTitle)} |`);
+  L.push(`| Cause racine (Davis) | **${cell(it.rootCause || 'Non identifiée')}** |`);
   L.push(`| Problème Dynatrace | [${cell(it.problemId)}](${it.problemUrl}) |`);
   L.push('');
 
@@ -183,7 +232,7 @@ function buildBody(it) {
     L.push("## Détail de l'échec");
     L.push('');
     if (it.failures.length) {
-      L.push('| Localisation | Étape | URL en erreur | Cause |');
+      L.push('| Localisation | Step en erreur | URL en erreur | Erreur (message / code) |');
       L.push('|---|---|---|---|');
       for (const f of it.failures) {
         const detail = f.detail ? ` — ${cell(f.detail)}` : '';
@@ -208,6 +257,8 @@ export default async function ({ execution_id }) {
 
   const monitors = (await ex.result('get_monitors'))?.records ?? [];
   const synth = (await ex.result('get_synthetic_events'))?.records ?? [];
+  let metricRows = [];
+  try { metricRows = (await ex.result('get_failed_steps'))?.records ?? []; } catch { metricRows = []; }
 
   const status = event['event.status'] === 'CLOSED' ? 'CLOSED' : 'OPEN';
   const start = toDate(event['event.start']);
@@ -216,6 +267,13 @@ export default async function ({ execution_id }) {
   // Label = display ID (P-…). Link = event.id, whatever format this Workflows version returns
   // (internal ID on older versions, P-… since 1.3537.6) – both are what the Problems app expects.
   const problemId = event['display_id'] ?? event['event.id'] ?? '';
+
+  // Root cause found by Davis (may be empty while the analysis is still running)
+  // root_cause_entity_* are deprecated in favour of root_cause.smartscape_entity, still populated today
+  const rcName = event['root_cause_entity_name'] ?? event['root_cause.smartscape_entity.name'] ?? '';
+  const rcId = event['root_cause_entity_id'] ?? event['root_cause.smartscape_entity'] ?? '';
+  const rootCause = rcName || rcId ? [rcName, rcId && rcId !== rcName ? `(${rcId})` : ''].filter(Boolean).join(' ') : '';
+  const problemTitle = event['event.name'] ?? '';
   const problemUrl =
     `${getEnvironmentUrl().replace(/\/$/, '')}/ui/apps/dynatrace.davis.problems/problem/${encodeURIComponent(event['event.id'] ?? problemId)}`;
 
@@ -223,6 +281,8 @@ export default async function ({ execution_id }) {
   const httpIds = (event['affected_entity_ids'] ?? []).filter((id) => String(id).startsWith('HTTP_CHECK-'));
   const known = new Set(monitors.map((m) => m.id));
   const missing = httpIds.filter((id) => !known.has(id)).map((id) => ({ id, name: id, tags: [] }));
+
+  const eventTags = parseTags(event['entity_tags']);
 
   // ---- Group monitors by recipient team ----
   const groups = {};
@@ -234,6 +294,9 @@ export default async function ({ execution_id }) {
     const pt = synth.find((r) => r.monitor_id === mon.id && (r.pt_team || r.pt_crit));
     if (!tags[TEAM_TAG_KEY] && pt?.pt_team) tags[TEAM_TAG_KEY] = String(pt.pt_team);
     if (!tags[CRIT_TAG_KEY] && pt?.pt_crit) tags[CRIT_TAG_KEY] = String(pt.pt_crit);
+    // Last resort: tags carried by the problem event itself (entity_tags of the affected entities)
+    if (!tags[TEAM_TAG_KEY] && eventTags[TEAM_TAG_KEY]) tags[TEAM_TAG_KEY] = eventTags[TEAM_TAG_KEY];
+    if (!tags[CRIT_TAG_KEY] && eventTags[CRIT_TAG_KEY]) tags[CRIT_TAG_KEY] = eventTags[CRIT_TAG_KEY];
     const teamTag = tags[TEAM_TAG_KEY];
     const recipients = teamTag ? ROUTING[teamTag.toUpperCase()] : undefined;
     const routed = Array.isArray(recipients) && recipients.length > 0;
@@ -252,8 +315,13 @@ export default async function ({ execution_id }) {
     const multi = g.monitors.length > 1;
     const nameById = Object.fromEntries(g.monitors.map((m) => [m.id, m.name]));
 
-    const failures = buildFailureRows(synth, ids).map((r) => {
-      const { cause, detail } = translateCause(r.code, r.message);
+    const fromMetric = buildRowsFromMetric(metricRows, synth, ids);
+    const rawRows = fromMetric.length ? fromMetric : buildFailureRows(synth, ids);
+    const failures = rawRows.map((r) => {
+      const t = translateCause(r.code, r.message);
+      const cause = t.cause;
+      const detail = [t.detail, r.http_status ? `HTTP ${r.http_status}` : '', r.count ? `${r.count} échec(s)` : '']
+        .filter(Boolean).join(' · ');
       return {
         location: multi ? `${r.location} — ${nameById[r.monitor_id]}` : r.location,
         step: r.step_name ? `${r.step} — ${r.step_name}` : r.step,
@@ -265,12 +333,18 @@ export default async function ({ execution_id }) {
 
     // Header URL: first failing URL if any, else any URL seen for these monitors
     const url = failures.find((f) => f.url)?.url ?? synth.find((r) => ids.has(r.monitor_id) && r.url)?.url ?? '';
+    // Monitor URL = URL of its first step (lowest step number seen in the detail events)
+    const monitorUrl =
+      synth
+        .filter((r) => ids.has(r.monitor_id) && r.url)
+        .sort((a, b) => Number(a.step ?? 1e9) - Number(b.step ?? 1e9))[0]?.url ?? '';
 
     const item = {
       to: g.to,
       team: [...g.teams].join(', '),
       monitor: g.monitors.map((m) => m.name).join(', '),
       url,
+      monitorUrl,
       criticite: highestCrit(g.monitors.map((m) => m.crit)),
       status,
       start: fmtDate(start),
@@ -278,6 +352,8 @@ export default async function ({ execution_id }) {
       duration: fmtDuration(start, end),
       problemId,
       problemUrl,
+      problemTitle,
+      rootCause,
       failures,
     };
 
@@ -291,5 +367,18 @@ export default async function ({ execution_id }) {
   // and rejected). So we send one email per recipient: `to` is a plain string here.
   const sends = emails.flatMap((e) => e.to.map((address) => ({ ...e, to: String(address).trim() })));
 
-  return { emails: sends, unrouted };
+  // Diagnostic: what came back from get_synthetic_events (visible in the task Result)
+  const debug = {
+    records: synth.length,
+    byType: synth.reduce((acc, r) => ({ ...acc, [r.type ?? 'null']: (acc[r.type ?? 'null'] ?? 0) + 1 }), {}),
+    failedSteps: synth.filter((r) => r.type === 'http_step_execution' && r.state === 'FAIL').length,
+    withUrl: synth.filter((r) => r.url).length,
+    metricRows: metricRows.length,
+    withStep: synth.filter((r) => r.step !== undefined && r.step !== null).length,
+    monitorsFromQuery: monitors.map((m) => ({ id: m.id, name: m.name, tags: m.tags })),
+    monitorsMissing: missing.map((m) => m.id),
+    eventEntityTags: event['entity_tags'] ?? null,
+  };
+
+  return { emails: sends, unrouted, debug };
 }
