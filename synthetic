@@ -200,20 +200,17 @@ function buildBody(it) {
   L.push('');
   L.push(`**Criticité :** ${CRIT_ICON[it.criticite] ?? '⚪'} ${it.criticite}  |  **Statut :** ${closed ? '🟢 RÉSOLU' : '🔴 OUVERT'}`);
   L.push('');
-  L.push(`**Moniteur :** ${it.monitor}`);
-  L.push('');
   if (it.url) {
     L.push(`**URL en erreur :** [${it.url}](${it.url})`);
     L.push('');
   }
-  L.push(`**[➜ Accéder au problème dans Dynatrace](${it.problemUrl})**`);
-  L.push('');
   L.push('---');
   L.push('');
   L.push("## Résumé de l'incident");
   L.push('');
   L.push('| Élément | Valeur |');
   L.push('|---|---|');
+  L.push(`| Moniteur | **${cell(it.monitor)}** |`);
   L.push(`| Équipe concernée | **${cell(it.team)}** |`);
   L.push('| Catégorie | **Disponibilité** |');
   L.push(`| Début de l'incident | **${cell(it.start)}** (heure de Paris) |`);
@@ -224,6 +221,8 @@ function buildBody(it) {
   if (it.problemTitle) L.push(`| Titre du problème | ${cell(it.problemTitle)} |`);
   L.push(`| Cause racine (dernier échec) | **${cell(it.rootCause || 'Non identifiée')}** |`);
   L.push(`| Problème Dynatrace | [${cell(it.problemId)}](${it.problemUrl}) |`);
+  L.push('');
+  L.push(`**[➜ Accéder au problème dans Dynatrace](${it.problemUrl})**`);
   L.push('');
 
   if (!closed) {
