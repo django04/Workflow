@@ -95,12 +95,27 @@ function buildFailureRows(records, monitorIds) {
       .filter((x) => x.gap <= STEP_MATCH_WINDOW_MS)
       .sort((a, b) => a.gap - b.gap)[0]?.s;
 
+    // URL of the failing request: "step details" record of the same monitor, same step if known,
+    // closest in time to the failed step (or to the execution)
+    const ref = toDate(step?.timestamp)?.getTime() ?? t;
+    const hasStep = step?.step !== undefined && step?.step !== null;
+    const closest = (list) =>
+      list
+        .map((d) => ({ d, gap: Math.abs((toDate(d.timestamp)?.getTime() ?? 0) - ref) }))
+        .filter((x) => x.gap <= STEP_MATCH_WINDOW_MS)
+        .sort((a, b) => a.gap - b.gap)[0]?.d;
+    const details = records.filter((r) => r.url && r.monitor_id === e.monitor_id);
+    const detail =
+      (hasStep ? closest(details.filter((d) => String(d.step) === String(step.step))) : undefined) ??
+      closest(details);
+
     rows.push({
       monitor_id: e.monitor_id,
       location: e.location ?? 'Inconnue',
-      step: step?.step !== undefined && step?.step !== null ? Number(step.step) + STEP_OFFSET : '',
+      step: hasStep ? Number(step.step) + STEP_OFFSET : '',
       code: step?.code ?? e.code,
       message: step?.message ?? e.message,
+      url: detail?.url ?? '',
     });
   }
   return rows;
@@ -146,11 +161,12 @@ function buildBody(it) {
     L.push("## Détail de l'échec");
     L.push('');
     if (it.failures.length) {
-      L.push('| Localisation | Étape | Cause |');
-      L.push('|---|---|---|');
+      L.push('| Localisation | Étape | URL en erreur | Cause |');
+      L.push('|---|---|---|---|');
       for (const f of it.failures) {
         const detail = f.detail ? ` — ${cell(f.detail)}` : '';
-        L.push(`| **${cell(f.location)}** | ${cell(f.step)} | **${cell(f.cause)}**${detail} |`);
+        const url = f.url ? `[${cell(f.url)}](${f.url})` : '—';
+        L.push(`| **${cell(f.location)}** | ${cell(f.step)} | ${url} | **${cell(f.cause)}**${detail} |`);
       }
     } else {
       L.push("_Aucun détail d'exécution disponible pour la période de l'incident._");
@@ -210,17 +226,19 @@ export default async function ({ execution_id }) {
     const multi = g.monitors.length > 1;
     const nameById = Object.fromEntries(g.monitors.map((m) => [m.id, m.name]));
 
-    const url = synth.find((r) => ids.has(r.monitor_id) && r.url)?.url ?? '';
-
     const failures = buildFailureRows(synth, ids).map((r) => {
       const { cause, detail } = translateCause(r.code, r.message);
       return {
         location: multi ? `${r.location} — ${nameById[r.monitor_id]}` : r.location,
         step: r.step,
+        url: r.url,
         cause,
         detail,
       };
     });
+
+    // Header URL: first failing URL if any, else any URL seen for these monitors
+    const url = failures.find((f) => f.url)?.url ?? synth.find((r) => ids.has(r.monitor_id) && r.url)?.url ?? '';
 
     const item = {
       to: g.to,
@@ -243,5 +261,9 @@ export default async function ({ execution_id }) {
     return item;
   });
 
-  return { emails, unrouted };
+  // The To field of the email task takes each {{ }} entry as ONE address (a list is rendered as text
+  // and rejected). So we send one email per recipient: `to` is a plain string here.
+  const sends = emails.flatMap((e) => e.to.map((address) => ({ ...e, to: String(address).trim() })));
+
+  return { emails: sends, unrouted };
 }
