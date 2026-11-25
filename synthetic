@@ -7,23 +7,28 @@ import { execution } from '@dynatrace-sdk/automation-utils';
 import { getEnvironmentUrl } from '@dynatrace-sdk/app-environment';
 
 // ---------------- Configuration ----------------
-const TEAM_TAG_KEY = 'team';        // tag on the monitor, e.g. team:EQUIPE-A
-const CRIT_TAG_KEY = 'criticite';   // tag on the monitor, e.g. criticite:MAJEUR
+const TEAM_TAG_KEY = 'team';        // tag Team on the HTTP monitor (key compared case-insensitively)
+const CRIT_TAG_KEY = 'criticality'; // tag criticality: top-majeur | majeur | non-majeur
 const ADMIN_RECIPIENTS = ['admin-observabilite@example.com'];
 
-// Keys = team tag values in UPPERCASE
+// Keys = values of the Team tag in UPPERCASE -> replace the example addresses
 const ROUTING = {
-  'EQUIPE-A': ['equipe-a@example.com'],
-  'EQUIPE-B': ['equipe-b@example.com', 'astreinte-b@example.com'],
+  SPAS: ['liste-spas@example.com'],
+  SPTW: ['liste-sptw@example.com'],
+  SPSU: ['liste-spsu@example.com'],
 };
 
-const CRIT_ORDER = ['CRITIQUE', 'MAJEUR', 'MINEUR'];   // highest wins if a team has several monitors
+const CRIT_ORDER = ['TOP MAJEUR', 'MAJEUR', 'NON MAJEUR'];   // highest wins if a team has several monitors
 const TZ = 'Europe/Paris';
 const STEP_OFFSET = 0;                // set to 1 if dt.synthetic.step.sequence_number is 0-based on your tenant
 const STEP_MATCH_WINDOW_MS = 120000;  // max gap between a failed execution and its failed step event
 // ------------------------------------------------
 
-const CRIT_ICON = { CRITIQUE: '🔴', MAJEUR: '🟠', MINEUR: '🔵', 'NON DÉFINIE': '⚪' };
+const CRIT_ICON = { 'TOP MAJEUR': '🔴', MAJEUR: '🟠', 'NON MAJEUR': '🔵', 'NON DÉFINIE': '⚪' };
+
+// "top-majeur" -> "TOP MAJEUR"; "majeur" -> "MAJEUR"; "non-majeur" / "non majeur" -> "NON MAJEUR"
+const normalizeCrit = (v) =>
+  String(v ?? '').trim().toUpperCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ');
 
 function toDate(v) {
   if (v === undefined || v === null || v === '') return null;
@@ -74,12 +79,19 @@ const highestCrit = (values) => CRIT_ORDER.find((c) => values.includes(c)) ?? 'N
 // Escape table-breaking characters for Markdown cells
 const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 
-// Latest failed monitor execution per monitor × location, enriched with the closest failed step
+// Latest failed monitor execution per monitor × location, with EVERY failed step of that execution
+// (one row per failed step, each with its own URL)
 function buildFailureRows(records, monitorIds) {
   const execs = records.filter(
     (r) => r.type === 'http_monitor_execution' && r.state === 'FAIL' && monitorIds.has(r.monitor_id),
   );
   const steps = records.filter((r) => r.type === 'http_step_execution' && r.state === 'FAIL');
+  const ts = (r) => toDate(r?.timestamp)?.getTime() ?? 0;
+  const closestTo = (list, ref) =>
+    list
+      .map((x) => ({ x, gap: Math.abs(ts(x) - ref) }))
+      .filter((y) => y.gap <= STEP_MATCH_WINDOW_MS)
+      .sort((a, b) => a.gap - b.gap)[0]?.x;
 
   const seen = new Set();
   const rows = [];
@@ -88,35 +100,45 @@ function buildFailureRows(records, monitorIds) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const t = toDate(e.timestamp)?.getTime() ?? 0;
-    const step = steps
-      .filter((s) => s.monitor_id === e.monitor_id)
-      .map((s) => ({ s, gap: Math.abs((toDate(s.timestamp)?.getTime() ?? 0) - t) }))
-      .filter((x) => x.gap <= STEP_MATCH_WINDOW_MS)
-      .sort((a, b) => a.gap - b.gap)[0]?.s;
-
-    // URL of the failing request: "step details" record of the same monitor, same step if known,
-    // closest in time to the failed step (or to the execution)
-    const ref = toDate(step?.timestamp)?.getTime() ?? t;
-    const hasStep = step?.step !== undefined && step?.step !== null;
-    const closest = (list) =>
-      list
-        .map((d) => ({ d, gap: Math.abs((toDate(d.timestamp)?.getTime() ?? 0) - ref) }))
-        .filter((x) => x.gap <= STEP_MATCH_WINDOW_MS)
-        .sort((a, b) => a.gap - b.gap)[0]?.d;
+    const t = ts(e);
     const details = records.filter((r) => r.url && r.monitor_id === e.monitor_id);
-    const detail =
-      (hasStep ? closest(details.filter((d) => String(d.step) === String(step.step))) : undefined) ??
-      closest(details);
+    const monSteps = steps.filter((s) => s.monitor_id === e.monitor_id);
 
-    rows.push({
-      monitor_id: e.monitor_id,
-      location: e.location ?? 'Inconnue',
-      step: hasStep ? Number(step.step) + STEP_OFFSET : '',
-      code: step?.code ?? e.code,
-      message: step?.message ?? e.message,
-      url: detail?.url ?? '',
-    });
+    // One failed step event per step number: the one closest to this execution
+    const byStep = new Map();
+    for (const s of monSteps) {
+      const k = s.step === undefined || s.step === null ? '?' : String(s.step);
+      const cur = byStep.get(k);
+      const gap = Math.abs(ts(s) - t);
+      if (gap <= STEP_MATCH_WINDOW_MS && (!cur || gap < Math.abs(ts(cur) - t))) byStep.set(k, s);
+    }
+    const failedSteps = [...byStep.values()].sort((a, b) => Number(a.step ?? 0) - Number(b.step ?? 0));
+
+    const base = { monitor_id: e.monitor_id, location: e.location ?? 'Inconnue' };
+
+    if (!failedSteps.length) {
+      // No step event found: execution-level result + closest URL
+      rows.push({
+        ...base, step: '', step_name: '', code: e.code, message: e.message,
+        url: closestTo(details, t)?.url ?? '',
+      });
+      continue;
+    }
+
+    for (const s of failedSteps) {
+      const hasStep = s.step !== undefined && s.step !== null;
+      const detail =
+        (hasStep ? closestTo(details.filter((d) => String(d.step) === String(s.step)), ts(s)) : undefined) ??
+        (failedSteps.length === 1 ? closestTo(details, ts(s)) : undefined);
+      rows.push({
+        ...base,
+        step: hasStep ? Number(s.step) + STEP_OFFSET : '',
+        step_name: s.step_name ?? '',
+        code: s.code ?? e.code,
+        message: s.message ?? e.message,
+        url: detail?.url ?? '',
+      });
+    }
   }
   return rows;
 }
@@ -207,7 +229,11 @@ export default async function ({ execution_id }) {
   const unrouted = [];
 
   for (const mon of [...monitors, ...missing]) {
+    // Entity tags first, then primary tags seen on the synthetic events of this monitor
     const tags = parseTags(mon.tags);
+    const pt = synth.find((r) => r.monitor_id === mon.id && (r.pt_team || r.pt_crit));
+    if (!tags[TEAM_TAG_KEY] && pt?.pt_team) tags[TEAM_TAG_KEY] = String(pt.pt_team);
+    if (!tags[CRIT_TAG_KEY] && pt?.pt_crit) tags[CRIT_TAG_KEY] = String(pt.pt_crit);
     const teamTag = tags[TEAM_TAG_KEY];
     const recipients = teamTag ? ROUTING[teamTag.toUpperCase()] : undefined;
     const routed = Array.isArray(recipients) && recipients.length > 0;
@@ -217,7 +243,7 @@ export default async function ({ execution_id }) {
     const key = routed ? teamTag.toUpperCase() : '__ADMIN__';
     groups[key] ??= { to: routed ? recipients : ADMIN_RECIPIENTS, teams: new Set(), monitors: [] };
     groups[key].teams.add(teamTag || 'NON DÉFINIE');
-    groups[key].monitors.push({ id: mon.id, name: mon.name, crit: (tags[CRIT_TAG_KEY] ?? '').toUpperCase() });
+    groups[key].monitors.push({ id: mon.id, name: mon.name, crit: normalizeCrit(tags[CRIT_TAG_KEY]) });
   }
 
   // ---- One email per group ----
@@ -230,7 +256,7 @@ export default async function ({ execution_id }) {
       const { cause, detail } = translateCause(r.code, r.message);
       return {
         location: multi ? `${r.location} — ${nameById[r.monitor_id]}` : r.location,
-        step: r.step,
+        step: r.step_name ? `${r.step} — ${r.step_name}` : r.step,
         url: r.url,
         cause,
         detail,
