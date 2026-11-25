@@ -4,7 +4,8 @@ Task order:
 
 ```
 trigger → get_monitors ──────────┐
-        → get_synthetic_events ──┴→ build_emails → send_email → fail_if_unrouted
+        → get_synthetic_events ──┤
+        → get_failed_steps ──────┴→ build_emails → send_email → fail_if_unrouted
 ```
 
 The built-in Send email action renders Markdown (headings, bold, links, tables), not HTML.
@@ -43,22 +44,53 @@ One query returns three kinds of records; the JS task correlates them:
 
 ```
 fetch dt.synthetic.events, from: toTimestamp("{{ event()['event.start'] }}") - 15m, to: now()
-| filter in(dt.synthetic.monitor.id, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
-| filter event.type == "http_monitor_execution"
-      or event.type == "http_step_execution"
-      or isNotNull(result.statistics.url)
+| fieldsAdd monitor_id = coalesce(dt.synthetic.monitor.id, dt.entity.http_check)
+| filter in(monitor_id, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
 | fields timestamp,
          type       = event.type,
-         monitor_id = dt.synthetic.monitor.id,
+         monitor_id,
          location   = entityName(dt.entity.synthetic_location),
-         step       = dt.synthetic.step.sequence_number,
+         step       = coalesce(dt.synthetic.step.sequence_number, step.sequence_number),
+         step_name  = coalesce(dt.synthetic.step.name, step.name),
          state      = result.state,
          code       = result.status.code,
          message    = result.status.message,
-         url        = result.statistics.url
+         url        = result.statistics.url,
+         pt_team    = coalesce(primary_tags.Team, primary_tags.team),
+         pt_crit    = primary_tags.criticality
 | sort timestamp desc
-| limit 2000
+| limit 5000
 ```
+
+---
+
+## 3b. Task `get_failed_steps` – Execute DQL Query
+
+Main source for the failure table: the `dt.synthetic.http.executions` metric is split by
+location **and** step, with the error message and code. `get_synthetic_events` is then only
+used for the URLs (and as a fallback).
+
+```
+timeseries failures = sum(dt.synthetic.http.executions, default: 0),
+  by: { dt.entity.http_check, dt.entity.synthetic_location, step.sequence_number, step.name,
+        result.status.code, result.status.message, result.http_status.code },
+  filter: in(dt.entity.http_check, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
+          and result.state == "FAIL",
+  from: toTimestamp("{{ event()['event.start'] }}") - 15m, to: now()
+| fieldsAdd failures = arraySum(failures)
+| filter failures > 0
+| sort failures desc
+| fields monitor_id  = dt.entity.http_check,
+         location    = entityName(dt.entity.synthetic_location),
+         step        = step.sequence_number,
+         step_name   = step.name,
+         code        = result.status.code,
+         message     = result.status.message,
+         http_status = result.http_status.code,
+         failures
+```
+
+Connect `get_failed_steps` → `build_emails` (condition: success).
 
 ---
 
