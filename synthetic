@@ -16,6 +16,7 @@ const ROUTING = {
   SPAS: ['liste-spas@example.com'],
   SPTW: ['liste-sptw@example.com'],
   SPSU: ['liste-spsu@example.com'],
+  PASAT: ['liste-pasat@example.com'],
 };
 
 const CRIT_ORDER = ['TOP MAJEUR', 'MAJEUR', 'NON MAJEUR'];   // highest wins if a team has several monitors
@@ -200,10 +201,6 @@ function buildBody(it) {
   L.push('');
   L.push(`**Criticité :** ${CRIT_ICON[it.criticite] ?? '⚪'} ${it.criticite}  |  **Statut :** ${closed ? '🟢 RÉSOLU' : '🔴 OUVERT'}`);
   L.push('');
-  if (it.url) {
-    L.push(`**URL en erreur :** [${it.url}](${it.url})`);
-    L.push('');
-  }
   L.push('---');
   L.push('');
   L.push("## Résumé de l'incident");
@@ -213,6 +210,11 @@ function buildBody(it) {
   L.push(`| Moniteur | **${cell(it.monitor)}** |`);
   L.push(`| Équipe concernée | **${cell(it.team)}** |`);
   L.push('| Catégorie | **Disponibilité** |');
+  const uniq = (arr) => [...new Set(arr.filter((x) => x !== undefined && x !== null && x !== ''))];
+  const locations = uniq(it.failures.map((f) => f.location));
+  const steps = uniq(it.failures.map((f) => f.step));
+  L.push(`| Localisation en échec | **${cell(locations.join(', ') || 'Non disponible')}** |`);
+  L.push(`| Step en erreur | **${cell(steps.join(', ') || 'Non disponible')}** |`);
   L.push(`| Début de l'incident | **${cell(it.start)}** (heure de Paris) |`);
   if (closed) {
     L.push(`| Fin de l'incident | **${cell(it.end)}** (heure de Paris) |`);
@@ -224,23 +226,6 @@ function buildBody(it) {
   L.push('');
   L.push(`**[➜ Accéder au problème dans Dynatrace](${it.problemUrl})**`);
   L.push('');
-
-  if (!closed) {
-    L.push("## Détail de l'échec");
-    L.push('');
-    if (it.failures.length) {
-      L.push('| Localisation | Step en erreur | URL en erreur | Erreur (message / code) |');
-      L.push('|---|---|---|---|');
-      for (const f of it.failures) {
-        const detail = f.detail ? ` — ${cell(f.detail)}` : '';
-        const url = f.url ? `[${cell(f.url)}](${f.url})` : '—';
-        L.push(`| **${cell(f.location)}** | ${cell(f.step)} | ${url} | **${cell(f.cause)}**${detail} |`);
-      }
-    } else {
-      L.push("_Aucun détail d'exécution disponible pour la période de l'incident._");
-    }
-    L.push('');
-  }
 
   L.push('---');
   L.push('');
