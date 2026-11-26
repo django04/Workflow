@@ -5,7 +5,7 @@ Task order:
 ```
 trigger → get_monitors ──────────┐
         → get_synthetic_events ──┤
-        → get_failed_steps ──────┴→ build_emails → send_email → fail_if_unrouted
+        → get_failed_steps ──────┴→ build_emails → send_email
 ```
 
 The built-in Send email action renders Markdown (headings, bold, links, tables), not HTML.
@@ -66,12 +66,12 @@ fetch dt.synthetic.events, from: toTimestamp("{{ event()['event.start'] }}") - 1
 
 ## 3b. Task `get_failed_steps` – Execute DQL Query
 
-Main source for the failure table: the `dt.synthetic.http.executions` metric is split by
-location **and** step, with the error message and code. `get_synthetic_events` is then only
+Main source for the failure table: the step-level `dt.synthetic.http.request.executions` metric
+(the monitor-level `dt.synthetic.http.executions` leaves the step empty) is split by location **and** step, with the error message and code. `get_synthetic_events` is then only
 used for the URLs (and as a fallback).
 
 ```
-timeseries failures = sum(dt.synthetic.http.executions, default: 0),
+timeseries failures = sum(dt.synthetic.http.request.executions, default: 0),
   by: { dt.entity.http_check, dt.entity.synthetic_location, step.sequence_number, step.name,
         result.status.code, result.status.message, result.http_status.code },
   filter: in(dt.entity.http_check, array({% for id in event()["affected_entity_ids"] if id.startswith("HTTP_CHECK-") %}"{{ id }}"{% if not loop.last %}, {% endif %}{% endfor %}))
@@ -106,29 +106,6 @@ Paste `build_emails.js` and edit its configuration block (tag keys, admin mailbo
 - **To:** `{{ _.item.to }}`
 - **Subject:** `{{ _.item.subject }}`
 - **Message:** `{{ _.item.body }}`
-
----
-
-## 6. Task `fail_if_unrouted` – Run JavaScript
-
-Runs after `send_email` succeeds. Fails the run if a monitor had no team tag or a tag missing from `ROUTING` (the admin mailbox already received the email).
-
-```js
-import { execution } from '@dynatrace-sdk/automation-utils';
-
-export default async function ({ execution_id }) {
-  const ex = await execution(execution_id);
-  const { unrouted = [] } = await ex.result('build_emails');
-
-  if (unrouted.length) {
-    const list = unrouted
-      .map((u) => `${u.monitor} (${u.id}, tag équipe : ${u.team ?? 'absent'})`)
-      .join('; ');
-    throw new Error(`Moniteurs sans routage : ${list}`);
-  }
-  return { ok: true };
-}
-```
 
 ---
 
